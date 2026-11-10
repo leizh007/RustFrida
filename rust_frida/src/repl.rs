@@ -252,6 +252,30 @@ pub(crate) fn try_managedcounter_on_main_thread(session: &Session, line: &str) -
     Ok(true)
 }
 
+/// `evalm <js>` —— 在目标进程主线程执行任意 JS。
+///
+/// REPL 原有的 `jseval`/`loadjs` 都被派发到 agent 的 worker 线程，那里既没有
+/// 主 looper 也没有合适的 ART 线程状态；要反射 `ActivityThread` 拿 Activity、
+/// 弹 Dialog 之类必须回到主线程。这里复用官方已有的
+/// `eval_js_on_main_thread`（ptrace 到主线程 + 该线程的 JS 入口）实现。
+pub(crate) fn try_evalm_on_main_thread(session: &Session, line: &str) -> Result<bool, String> {
+    let Some(rest) = line
+        .strip_prefix("evalm ")
+        .or_else(|| line.strip_prefix("evalm\n"))
+        .or_else(|| line.strip_prefix("evalm"))
+    else {
+        return Ok(false);
+    };
+    if rest.trim().is_empty() {
+        return Ok(false);
+    }
+
+    log_info!("evalm 切到主线程执行 JS");
+    crate::remote_agent::eval_js_on_main_thread(session, rest, "<evalm>", false)
+        .map_err(|e| format!("主线程执行 evalm 失败: {}", e))?;
+    Ok(true)
+}
+
 fn wrap_jseval_expr(expr: &str) -> String {
     format!(
         "(() => {{ try {{ return eval({}); }} catch (e) {{ let msg = String((e && e.message) ? ((e.name || 'Error') + ': ' + e.message) : e); let st = ''; try {{ st = (e && e.stack) ? String(e.stack) : ''; }} catch (_) {{}} let s = st ? (st.indexOf(msg) >= 0 ? st : (msg + '\\n' + st)) : msg; return {} + s; }} }})()",
@@ -440,6 +464,7 @@ pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)
             ("jsinit", "", "初始化 QuickJS 引擎"),
             ("loadjs", "<script>", "执行 JavaScript 代码"),
             ("jseval", "<expr>", "求值 JS 表达式并显示结果"),
+            ("evalm", "<js>", "在主线程执行 JS（反射 Activity、弹窗等）"),
             ("jsclean", "", "清理 QuickJS 引擎"),
             ("jsrepl", "", "进入 JS REPL 模式（Tab 动态补全）"),
             ("%reload", "[path]", "重载脚本（jsclean+jsinit+loadjs，不退出）"),

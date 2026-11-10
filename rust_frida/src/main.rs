@@ -39,9 +39,9 @@ use nix::unistd::Pid;
 use process::{attach_to_process, call_target_function, find_pid_by_name};
 use repl::{
     ensure_java_worker_ready_after_resume, load_script_file, load_script_file_pre_resume, print_eval_result,
-    print_help, rewrite_jseval_for_agent, run_js_repl, script_uses_java_api, try_jseval_on_main_thread_if_java_or_dsl,
-    try_loadjs_on_main_thread_if_java, try_managedcounter_on_main_thread, CommandCompleter, EVAL_DEFAULT_TIMEOUT_SECS,
-    EVAL_JAVA_TIMEOUT_SECS, EVAL_RECOMP_TIMEOUT_SECS,
+    print_help, rewrite_jseval_for_agent, run_js_repl, script_uses_java_api, try_evalm_on_main_thread,
+    try_jseval_on_main_thread_if_java_or_dsl, try_loadjs_on_main_thread_if_java, try_managedcounter_on_main_thread,
+    CommandCompleter, EVAL_DEFAULT_TIMEOUT_SECS, EVAL_JAVA_TIMEOUT_SECS, EVAL_RECOMP_TIMEOUT_SECS,
 };
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
@@ -555,6 +555,7 @@ fn main() {
                 let is_recomp = line.starts_with("recomp");
                 let is_eval_cmd = line.starts_with("jseval ")
                     || line.starts_with("loadjs ")
+                    || line.starts_with("evalm ")
                     || line == "jsinit"
                     || line == "jsclean"
                     || line.starts_with("managedcounter ")
@@ -562,7 +563,14 @@ fn main() {
                 if is_eval_cmd {
                     session.eval_state.clear();
                 }
-                let handled_by_main_thread = match try_managedcounter_on_main_thread(&session, &line)
+                let handled_by_main_thread = match try_evalm_on_main_thread(&session, &line)
+                    .and_then(|handled| {
+                        if handled {
+                            Ok(true)
+                        } else {
+                            try_managedcounter_on_main_thread(&session, &line)
+                        }
+                    })
                     .and_then(|handled| {
                         if handled {
                             Ok(true)
