@@ -36,6 +36,8 @@ const SYS_PIDFD_GETFD: i64 = 438;
 const PAGE_SIZE: u64 = 4096;
 const LOADER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const LOADER_IO_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// loader 走 abstract socket 回退时，host 等它连上来的最长时间。
+const FALLBACK_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn align_down(value: u64, alignment: u64) -> u64 {
     value & !(alignment - 1)
@@ -112,6 +114,112 @@ fn extract_fd_from_target(pid: i32, target_fd: i32) -> Result<RawFd, String> {
 
     log_verbose!("pidfd_getfd: pid={} target_fd={} → host_fd={}", pid, target_fd, host_fd);
     Ok(host_fd as RawFd)
+}
+
+/// pidfd_getfd 是否可用。内核未编入 CONFIG_CHECKPOINT_RESTORE、或内核版本低于
+/// 5.9 时该 syscall 返回 ENOSYS；探一次并缓存结果，避免每个注入流程都白跑一遍。
+///
+/// 设置 `RUSTFRIDA_FORCE_CTRLFD_FALLBACK=1` 可强制走 abstract socket 回退（探测
+/// 在少数定制内核上不准时用）。
+fn pidfd_getfd_supported() -> bool {
+    if std::env::var_os("RUSTFRIDA_FORCE_CTRLFD_FALLBACK").is_some() {
+        return false;
+    }
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, libc::getpid(), 0) };
+        if pidfd < 0 {
+            log_verbose!("pidfd_open 不可用: {}", std::io::Error::last_os_error());
+            return false;
+        }
+        // 用一个本进程必然存在的 fd（0）探 pidfd_getfd 本身是否被内核实现。
+        let probe = unsafe { libc::syscall(SYS_PIDFD_GETFD, pidfd as i32, 0i32, 0u32) };
+        let errno = std::io::Error::last_os_error();
+        if probe >= 0 {
+            unsafe { close(probe as i32) };
+        }
+        unsafe { close(pidfd as i32) };
+
+        if probe >= 0 {
+            return true;
+        }
+        // EPERM/EINVAL 说明 syscall 存在，只是参数/权限被拒；只有 ENOSYS 才是未实现。
+        if errno.raw_os_error() == Some(libc::ENOSYS) {
+            log_verbose!("pidfd_getfd 不受内核支持(ENOSYS)");
+            false
+        } else {
+            true
+        }
+    })
+}
+
+/// 在 host 侧创建 abstract unix socket 监听，供 loader 的 fallback 路径连接。
+///
+/// pidfd_getfd 需要内核支持（CONFIG_CHECKPOINT_RESTORE + Android 5.9+）；在
+/// 老内核上返回 ENOSYS，此时 loader 会退回到「连接 host 预先建好的 abstract
+/// socket」，因此 host 端必须在调用 loader 之前就 bind+listen。
+fn create_fallback_listener(pid: i32) -> Result<RawFd, String> {
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(format!("abstract socket 创建失败: {}", std::io::Error::last_os_error()));
+    }
+
+    // sun_path[0] = '\0' 表示 abstract 命名空间，其余字节是名字本身。
+    let name = format!("\0rustfrida-{}", pid);
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let name_bytes = name.as_bytes();
+    if name_bytes.len() > addr.sun_path.len() {
+        unsafe { close(fd) };
+        return Err(format!("abstract socket 名过长: {}", name_bytes.len()));
+    }
+    for (slot, byte) in addr.sun_path.iter_mut().zip(name_bytes.iter()) {
+        *slot = *byte as libc::c_char;
+    }
+    let addr_len = (size_of::<libc::sa_family_t>() + name_bytes.len()) as libc::socklen_t;
+    if unsafe { libc::bind(fd, &addr as *const _ as *const libc::sockaddr, addr_len) } < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { close(fd) };
+        return Err(format!("abstract socket bind 失败: {}", err));
+    }
+    if unsafe { libc::listen(fd, 1) } < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { close(fd) };
+        return Err(format!("abstract socket listen 失败: {}", err));
+    }
+
+    Ok(fd)
+}
+
+/// 阻塞等待 loader 的 fallback 连接，超时由 `timeout_secs` 控制。
+fn accept_fallback_connection(listen_fd: RawFd, timeout_secs: u64) -> Result<RawFd, String> {
+    // accept() 自己不吃超时参数（SO_RCVTIMEO 对 accept 的行为依赖内核），先用
+    // poll() 等可读再 accept，超时路径才确定。
+    let mut poll_fd = libc::pollfd {
+        fd: listen_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = (timeout_secs.saturating_mul(1000)).min(i32::MAX as u64) as libc::c_int;
+    match unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) } {
+        0 => return Err(format!("等待 loader fallback 连接超时（{}s）", timeout_secs)),
+        n if n < 0 => {
+            return Err(format!(
+                "等待 loader fallback 连接失败: {}",
+                std::io::Error::last_os_error()
+            ))
+        }
+        _ => {}
+    }
+
+    let fd = unsafe { libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+    if fd < 0 {
+        return Err(format!(
+            "接收 loader fallback 连接失败: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(fd)
 }
 
 /// 设置 fd 的 SELinux label，使 untrusted_app 能通过 SCM_RIGHTS 接收。
@@ -1144,6 +1252,19 @@ fn inject_via_bootstrapper_once(
 
     let mem = ProcMem::open(pid as u32)?;
 
+    // pidfd_getfd 需要内核 5.9+ 且开启 CONFIG_CHECKPOINT_RESTORE；旧内核直接返回
+    // ENOSYS。探测决定本次注入是否让 bootstrapper 预先建 socketpair——不建的话
+    // loader 只能走 abstract socket 回退，host 必须先 bind+listen 好等它连过来。
+    let use_ctrlfd_fallback = !pidfd_getfd_supported();
+    if use_ctrlfd_fallback {
+        log_warn!("pidfd_getfd 不可用，改用 abstract socket 回传 ctrl fd");
+    }
+    let fallback_listener = if use_ctrlfd_fallback {
+        Some(create_fallback_listener(pid)?)
+    } else {
+        None
+    };
+
     let initial_regs = match crate::process::get_registers_pub(trace_tid) {
         Ok(regs) => regs,
         Err(e) => return Err(e),
@@ -1223,7 +1344,7 @@ fn inject_via_bootstrapper_once(
     bootstrap_ctx.allocation_base = alloc_base as u64; // 非 NULL → Phase 2
     bootstrap_ctx.allocation_size = total_alloc as u64;
     bootstrap_ctx.page_size = page_size as u64;
-    bootstrap_ctx.enable_ctrlfds = 1;
+    bootstrap_ctx.enable_ctrlfds = if use_ctrlfd_fallback { 0 } else { 1 };
     bootstrap_ctx.libc = libc_api_addr as u64;
     mem_write_value(&mem, ctx_addr, &bootstrap_ctx)?;
 
@@ -1263,13 +1384,17 @@ fn inject_via_bootstrapper_once(
     log_verbose!("agent linker: 自解析 ELF/重定位/外部符号，不调用 dlopen/dlsym");
     log_verbose!("loader thread: raw clone，不调用 libc pthread");
 
-    // 提取 ctrlfds[0] 到 host
-    let host_ctrl_fd = extract_fd_from_target(pid, bootstrap_ctx.ctrlfds[0])?;
-    log_verbose!(
-        "已提取 ctrl fd: target {} → host {}",
-        bootstrap_ctx.ctrlfds[0],
-        host_ctrl_fd
-    );
+    // 拿 host 侧的 ctrl fd：优先 pidfd_getfd 直接抓目标进程的 socketpair 端点，
+    // 否则等 loader 通过 abstract socket 连过来。
+    let mut host_ctrl_fd: RawFd = -1;
+    if !use_ctrlfd_fallback {
+        host_ctrl_fd = extract_fd_from_target(pid, bootstrap_ctx.ctrlfds[0])?;
+        log_verbose!(
+            "已提取 ctrl fd: target {} → host {}",
+            bootstrap_ctx.ctrlfds[0],
+            host_ctrl_fd
+        );
+    }
 
     // === 写入 StringTable ===
     let string_table_offset = size_of::<FridaLibcApi>()
@@ -1295,7 +1420,9 @@ fn inject_via_bootstrapper_once(
     let entrypoint_str = b"hello_entry\0";
     let current_thread_eval_str = b"rustfrida_loadjs_current_thread\0";
     let data_str = b"\0";
-    let fallback_str = format!("\x00rustfrida-{}\0", pid); // abstract socket: \0 prefix
+    // loader 的 frida_connect 自己会写 sun_path[0] = '\0' 再加名字，所以这里
+    // 不能带前导 '\0'——否则名字在第一个字节就被截断，连的是空名字 socket。
+    let fallback_str = format!("rustfrida-{}\0", pid);
     mem.pwrite_all(entrypoint_str, str_base as u64)?;
     let current_thread_eval_str_addr = str_base + entrypoint_str.len();
     mem.pwrite_all(current_thread_eval_str, current_thread_eval_str_addr as u64)?;
@@ -1323,7 +1450,12 @@ fn inject_via_bootstrapper_once(
     // 调用 loader（执行 raw clone 后立即返回）
     log_verbose!("调用 loader...");
     let _ = call_target_function(trace_tid, alloc_base, &[loader_ctx_addr], None).map_err(|e| {
-        unsafe { close(host_ctrl_fd) };
+        if host_ctrl_fd >= 0 {
+            unsafe { close(host_ctrl_fd) };
+        }
+        if let Some(fd) = fallback_listener {
+            unsafe { close(fd) };
+        }
         format!("loader 执行失败: {}", e)
     })?;
 
@@ -1345,6 +1477,18 @@ fn inject_via_bootstrapper_once(
     // === ptrace 分离 ===
     stop_world.detach_all();
     log_success!("已分离目标进程");
+
+    // loader 线程要等目标进程恢复运行才会起来 connect，所以必须在 detach 之后
+    // 才 accept；这段期间目标进程已被放行，loader 侧不会阻塞。
+    if let Some(listen_fd) = fallback_listener {
+        host_ctrl_fd = accept_fallback_connection(listen_fd, FALLBACK_ACCEPT_TIMEOUT.as_secs())
+            .map_err(|e| {
+                unsafe { close(listen_fd) };
+                e
+            })?;
+        unsafe { close(listen_fd) };
+        log_verbose!("loader fallback 已连接: host_ctrl_fd={}", host_ctrl_fd);
+    }
 
     // === Host 端 loader IPC 握手 ===
     let result = run_loader_handshake(

@@ -87,6 +87,12 @@
 #ifndef R_AARCH64_RELATIVE
 # define R_AARCH64_RELATIVE 1027
 #endif
+/* Thread-local storage descriptor (TLSDESC). The agent must be built free of
+ * TLS (see hook_engine_art.c), but third-party blobs occasionally still carry
+ * one; treat it as a soft zero instead of aborting the whole link. */
+#ifndef R_AARCH64_TLSDESC
+# define R_AARCH64_TLSDESC 1031
+#endif
 #ifndef STT_GNU_IFUNC
 # define STT_GNU_IFUNC 10
 #endif
@@ -1013,6 +1019,14 @@ rustfrida_apply_relocations (RustFridaLinkedModule * module, ElfW(Rela) * rela, 
         if (!rustfrida_resolve_symbol (module, sym_index, libc, &symbol_value))
           return false;
         *target = symbol_value + r->r_addend;
+        break;
+      case R_AARCH64_TLSDESC:
+        /* The loader installs no TLS blocks, so there is nowhere to point a
+         * descriptor at. Writing 0 keeps the link alive for modules that only
+         * carry the relocation as dead metadata; a module that actually reads
+         * the thread-local will still fault, which is why the agent itself is
+         * built without TLS. */
+        *target = 0;
         break;
       default:
         if (libc->sprintf != NULL)
