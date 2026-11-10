@@ -36,8 +36,13 @@ volatile uint64_t g_managed_direct_hit_count = 0;
 
 /* Managed helper reentrancy guard.  Generated managed helpers enter this
  * guard before executing DSL code; ART routing checks it to bypass nested Java
- * calls made from inside the helper on the same thread. */
-static __thread uint32_t g_managed_reentry_guard_depth = 0;
+ * calls made from inside the helper on the same thread.
+ *
+ * NOTE: this state is deliberately kept out of thread-local storage.  The agent
+ * is linked by rustfrida's own loader, which has no dynamic-TLS support, so any
+ * `__thread` variable would emit an R_AARCH64_TLSDESC relocation that resolves
+ * to 0 and turns the first hook into a `blr 0`.  Per-thread slots keyed by
+ * TPIDR_EL0 give the same semantics without a PT_TLS segment. */
 volatile uint32_t g_managed_reentry_guard_enabled = 1;
 volatile uint64_t g_managed_reentry_guard_enter = 0;
 volatile uint64_t g_managed_reentry_guard_bypass = 0;
@@ -51,6 +56,8 @@ typedef struct {
 static ManagedGuardSlot g_managed_guard_slots[MANAGED_GUARD_SLOTS] = {{0}};
 static volatile uint64_t g_managed_guard_active = 0;
 static uint64_t hook_current_tpidr_el0(void);
+static ManagedGuardSlot* managed_guard_lookup(uint64_t thread);
+static ManagedGuardSlot* managed_guard_acquire(uint64_t thread);
 static void emit_art_router_inc_counter(Arm64Writer* w, volatile uint64_t* counter);
 
 /* Fast $orig bypass state */
@@ -330,57 +337,69 @@ int hook_managed_reentry_guard_enabled(void) {
     return __atomic_load_n(&g_managed_reentry_guard_enabled, __ATOMIC_ACQUIRE) != 0;
 }
 
-void hook_managed_reentry_guard_enter(void) {
-    if (__atomic_load_n(&g_managed_reentry_guard_enabled, __ATOMIC_RELAXED) == 0) {
-        return;
+/* Find the slot owned by `thread`, or NULL.  Read-only; safe to call from any
+ * context, including inside a hook callback. */
+static ManagedGuardSlot* managed_guard_lookup(uint64_t thread) {
+    if (thread == 0) {
+        return NULL;
     }
-    if (g_managed_reentry_guard_depth != UINT32_MAX) {
-        g_managed_reentry_guard_depth++;
-    }
-    __atomic_add_fetch(&g_managed_reentry_guard_enter, 1, __ATOMIC_RELAXED);
-
-    uint64_t thread = hook_current_tpidr_el0();
     for (int i = 0; i < MANAGED_GUARD_SLOTS; i++) {
         ManagedGuardSlot* slot = &g_managed_guard_slots[i];
         if (__atomic_load_n(&slot->thread, __ATOMIC_ACQUIRE) == thread) {
-            __atomic_add_fetch(&slot->depth, 1, __ATOMIC_ACQ_REL);
-            return;
+            return slot;
         }
     }
+    return NULL;
+}
+
+/* Claim a free slot for `thread` and initialise its depth to 1.  Returns NULL
+ * when all slots are taken (64 live managed-hook threads is far past anything
+ * ART spawns in practice). */
+static ManagedGuardSlot* managed_guard_acquire(uint64_t thread) {
     for (int i = 0; i < MANAGED_GUARD_SLOTS; i++) {
         ManagedGuardSlot* slot = &g_managed_guard_slots[i];
         uint64_t expected = 0;
-        if (__atomic_compare_exchange_n(&slot->thread, &expected, 1,
+        if (__atomic_compare_exchange_n(&slot->thread, &expected, (uint64_t) 1,
                                          0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
             __atomic_store_n(&slot->depth, 1, __ATOMIC_RELEASE);
             __atomic_thread_fence(__ATOMIC_RELEASE);
             __atomic_store_n(&slot->thread, thread, __ATOMIC_RELEASE);
             __atomic_add_fetch(&g_managed_guard_active, 1, __ATOMIC_RELEASE);
-            return;
+            return slot;
         }
     }
+    return NULL;
+}
+
+void hook_managed_reentry_guard_enter(void) {
+    if (__atomic_load_n(&g_managed_reentry_guard_enabled, __ATOMIC_RELAXED) == 0) {
+        return;
+    }
+    __atomic_add_fetch(&g_managed_reentry_guard_enter, 1, __ATOMIC_RELAXED);
+
+    uint64_t thread = hook_current_tpidr_el0();
+    ManagedGuardSlot* slot = managed_guard_lookup(thread);
+    if (slot != NULL) {
+        if (__atomic_load_n(&slot->depth, __ATOMIC_ACQUIRE) != UINT32_MAX) {
+            __atomic_add_fetch(&slot->depth, 1, __ATOMIC_ACQ_REL);
+        }
+        return;
+    }
+    managed_guard_acquire(thread);
 }
 
 void hook_managed_reentry_guard_leave(void) {
-    if (g_managed_reentry_guard_depth > 0) {
-        g_managed_reentry_guard_depth--;
-    }
-
-    uint64_t thread = hook_current_tpidr_el0();
-    for (int i = 0; i < MANAGED_GUARD_SLOTS; i++) {
-        ManagedGuardSlot* slot = &g_managed_guard_slots[i];
-        if (__atomic_load_n(&slot->thread, __ATOMIC_ACQUIRE) != thread) {
-            continue;
-        }
-        uint32_t depth = __atomic_load_n(&slot->depth, __ATOMIC_ACQUIRE);
-        if (depth > 1) {
-            __atomic_sub_fetch(&slot->depth, 1, __ATOMIC_ACQ_REL);
-        } else {
-            __atomic_store_n(&slot->depth, 0, __ATOMIC_RELEASE);
-            __atomic_store_n(&slot->thread, 0, __ATOMIC_RELEASE);
-            __atomic_sub_fetch(&g_managed_guard_active, 1, __ATOMIC_RELEASE);
-        }
+    ManagedGuardSlot* slot = managed_guard_lookup(hook_current_tpidr_el0());
+    if (slot == NULL) {
         return;
+    }
+    uint32_t depth = __atomic_load_n(&slot->depth, __ATOMIC_ACQUIRE);
+    if (depth > 1) {
+        __atomic_sub_fetch(&slot->depth, 1, __ATOMIC_ACQ_REL);
+    } else {
+        __atomic_store_n(&slot->depth, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&slot->thread, 0, __ATOMIC_RELEASE);
+        __atomic_sub_fetch(&g_managed_guard_active, 1, __ATOMIC_RELEASE);
     }
 }
 
@@ -388,7 +407,8 @@ int hook_managed_reentry_guard_active(void) {
     if (__atomic_load_n(&g_managed_reentry_guard_enabled, __ATOMIC_RELAXED) == 0) {
         return 0;
     }
-    if (g_managed_reentry_guard_depth == 0) {
+    ManagedGuardSlot* slot = managed_guard_lookup(hook_current_tpidr_el0());
+    if (slot == NULL || __atomic_load_n(&slot->depth, __ATOMIC_ACQUIRE) == 0) {
         return 0;
     }
     __atomic_add_fetch(&g_managed_reentry_guard_bypass, 1, __ATOMIC_RELAXED);
@@ -396,7 +416,11 @@ int hook_managed_reentry_guard_active(void) {
 }
 
 uint32_t hook_managed_reentry_guard_depth(void) {
-    return g_managed_reentry_guard_depth;
+    ManagedGuardSlot* slot = managed_guard_lookup(hook_current_tpidr_el0());
+    if (slot == NULL) {
+        return 0;
+    }
+    return __atomic_load_n(&slot->depth, __ATOMIC_ACQUIRE);
 }
 
 uint64_t hook_managed_reentry_guard_enters(void) {
@@ -661,11 +685,51 @@ volatile uint64_t g_fast_orig_active = 0;
 volatile uint64_t g_fast_orig_frame_thread = 0;
 volatile uint64_t g_fast_orig_frame_sp = 0;
 
-static __thread HookContext g_art_router_tls_ctx;
+/* Per-thread quick-callback context.
+ *
+ * The generated router thunks need a stable HookContext that survives across
+ * the callback (the pointer is kept in x22).  It used to be a `__thread`
+ * variable, which on aarch64 compiles into a TLSDESC access — unsupported by
+ * rustfrida's loader, so the first instance-method hook died on `blr 0`.
+ * Keying an explicit slot table on TPIDR_EL0 keeps the one-context-per-thread
+ * semantics without emitting any TLS relocation. */
+#define ART_ROUTER_CTX_SLOTS 64
+typedef struct {
+    volatile uint64_t thread;
+    HookContext ctx;
+} ArtRouterCtxSlot;
+static ArtRouterCtxSlot g_art_router_ctx_slots[ART_ROUTER_CTX_SLOTS] = {{0}};
+/* Used only if every slot is taken; degrades to the old shared-context
+ * behaviour instead of returning NULL into the generated thunk. */
+static HookContext g_art_router_ctx_fallback;
+
+static HookContext* art_router_ctx_for_current_thread(void) {
+    uint64_t thread = hook_current_tpidr_el0();
+    if (thread == 0) {
+        return &g_art_router_ctx_fallback;
+    }
+    for (int i = 0; i < ART_ROUTER_CTX_SLOTS; i++) {
+        ArtRouterCtxSlot* slot = &g_art_router_ctx_slots[i];
+        if (__atomic_load_n(&slot->thread, __ATOMIC_ACQUIRE) == thread) {
+            return &slot->ctx;
+        }
+    }
+    for (int i = 0; i < ART_ROUTER_CTX_SLOTS; i++) {
+        ArtRouterCtxSlot* slot = &g_art_router_ctx_slots[i];
+        uint64_t expected = 0;
+        if (__atomic_compare_exchange_n(&slot->thread, &expected, (uint64_t) 1,
+                                         0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            __atomic_thread_fence(__ATOMIC_RELEASE);
+            __atomic_store_n(&slot->thread, thread, __ATOMIC_RELEASE);
+            return &slot->ctx;
+        }
+    }
+    return &g_art_router_ctx_fallback;
+}
 
 static HookContext* art_router_prepare_quick_context(void* frame_sp, void* save_frame_sp) {
     uint8_t* sp = (uint8_t*)frame_sp;
-    HookContext* ctx = &g_art_router_tls_ctx;
+    HookContext* ctx = art_router_ctx_for_current_thread();
     uint64_t thread = 0;
 #if defined(__aarch64__)
     __asm__ __volatile__("mov %0, x19" : "=r"(thread));
