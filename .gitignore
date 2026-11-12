@@ -1,5 +1,6 @@
 /target/
 /loader/build/
+/dist/
 .idea/
 *.md
 *.lock
