@@ -23,6 +23,7 @@ struct FastHookInvokeBypass {
 
 impl FastHookInvokeBypass {
     unsafe fn for_art_method(art_method: u64) -> Self {
+        // Fast hooks first: they have a replacement that is safe to re-enter.
         if let Some((quick_trampoline, _use_blr)) = fast_hook_invoke_meta(art_method) {
             crate::jsapi::java::art_controller::set_call_original_bypass(art_method);
             let c_thread_id = crate::current_thread_id_u64();
@@ -38,6 +39,45 @@ impl FastHookInvokeBypass {
                 c_active,
             };
         }
+
+        // Any other registered hook (plain `.implementation`, managed hooks, ...)
+        // is reached through the ART router thunk. If JS calls such a method
+        // directly, the JS thread re-enters the router while it already owns a
+        // router frame for that same method, and the ART/QuickJS state it walks
+        // over is no longer consistent -- the process dies a few calls later
+        // inside QuickJS allocation. Bypass the router here so a JS-side call
+        // behaves like an ordinary invocation of the original method.
+        //
+        // Router hooks carry no quick_trampoline (only fastHook installs one),
+        // so the bypass has to come from the controller-side flag that
+        // art_router_stack_check consults, not from the C-side orig_bypass slot.
+        if let Some((quick_trampoline, _is_static)) = any_hook_invoke_meta(art_method) {
+            if quick_trampoline != 0 {
+                let c_thread_id = crate::current_thread_id_u64();
+                let c_active = hook_ffi::orig_bypass_set(c_thread_id, art_method, quick_trampoline) == 0;
+                crate::jsapi::console::output_verbose(&format!(
+                    "[java.invoke] router bypass (native): ArtMethod={:#x}, trampoline={:#x}, c_bypass={}",
+                    art_method, quick_trampoline, c_active
+                ));
+                return Self {
+                    active: true,
+                    c_thread_id,
+                    c_active,
+                };
+            }
+
+            crate::jsapi::java::art_controller::set_call_original_bypass(art_method);
+            crate::jsapi::console::output_verbose(&format!(
+                "[java.invoke] router bypass (controller): ArtMethod={:#x}",
+                art_method
+            ));
+            return Self {
+                active: true,
+                c_thread_id: 0,
+                c_active: false,
+            };
+        }
+
         Self {
             active: false,
             c_thread_id: 0,
@@ -253,11 +293,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             ),
         );
     }
-    let _fast_hook_bypass = if raw_clone {
-        FastHookInvokeBypass::for_art_method(mid as u64)
-    } else {
-        FastHookInvokeBypass::for_method(env, cls, mid, false)
-    };
+    let _fast_hook_bypass = FastHookInvokeBypass::for_method(env, cls, mid, false);
 
     // Build jvalue args from JS values
     let jargs = build_invoke_jargs(ctx, env, argv, &param_types);
@@ -579,11 +615,12 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ),
         );
     }
-    let _fast_hook_bypass = if raw_clone {
-        FastHookInvokeBypass::for_art_method(mid as u64)
-    } else {
-        FastHookInvokeBypass::for_method(env, cls, mid, true)
-    };
+    // `mid` may be a JNI method ID or, on some paths, an ArtMethod* already.
+    // FastHookInvokeBypass::for_method checks both and falls back to
+    // decode_method_id, so it must be used on the raw-clone path too: branching
+    // on raw_clone here skipped decoding, the registry lookup found nothing,
+    // and a JS-side call into a hooked method re-entered the ART router.
+    let _fast_hook_bypass = FastHookInvokeBypass::for_method(env, cls, mid, true);
 
     let jargs = build_jargs_from_argv(ctx, env, argv, 3, &param_types);
     let jargs_ptr = if param_count > 0 {
@@ -941,11 +978,7 @@ pub(super) unsafe extern "C" fn js_java_new_object(
             format!("Java._newObject: GetMethodID failed: {}.<init>{}", class_name, ctor_sig),
         );
     }
-    let _fast_hook_bypass = if raw_clone {
-        FastHookInvokeBypass::for_art_method(mid as u64)
-    } else {
-        FastHookInvokeBypass::for_method(env, cls, mid, false)
-    };
+    let _fast_hook_bypass = FastHookInvokeBypass::for_method(env, cls, mid, false);
 
     let jargs = build_jargs_from_argv(ctx, env, argv, 2, &param_types);
     let jargs_ptr = if param_count > 0 {

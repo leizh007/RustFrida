@@ -220,6 +220,26 @@ pub(super) fn fast_hook_invoke_meta(art_method: u64) -> Option<(u64, bool)> {
     }
 }
 
+/// Invocation metadata for *any* registered hook, not just fast hooks.
+///
+/// `fast_hook_invoke_meta` deliberately answers only for the fastHook family,
+/// because only those install a replacement that can be entered re-entrantly
+/// without corrupting ART state. A plain `Java.use(cls).m.implementation` hook
+/// is routed through the ART router thunk instead, and calling such a method
+/// from JS while it is hooked makes the JS thread re-enter the router on top of
+/// its own frame. That path ends in heap corruption a few calls later
+/// (crash inside QuickJS `JS_GetPropertyStr` -> `realloc`), so JS-side
+/// invocation needs to bypass the router for every hooked method, not only
+/// fast hooks.
+///
+/// Returns `(quick_trampoline, is_static)`; `quick_trampoline` is 0 when the
+/// registry has no trampoline recorded, which callers treat as "no bypass".
+pub(super) fn any_hook_invoke_meta(art_method: u64) -> Option<(u64, bool)> {
+    let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let data = guard.as_ref()?.get(&art_method)?;
+    Some((data.quick_trampoline, data.is_static))
+}
+
 pub(crate) fn registered_methods_for_class(class_name: &str) -> Vec<MethodInfo> {
     let prefix = format!("{}.", class_name);
     let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
