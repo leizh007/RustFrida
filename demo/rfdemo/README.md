@@ -83,28 +83,40 @@ adb -s $DEV shell "su -c '(sleep 30) | /data/local/tmp/rustfrida --pid $PID < /d
 | **静态方法 hook** | ✅ `HIT 1,2` 连续 7 次命中 |
 | **`evalm` 主线程执行** | ✅ 返回 `EVALM_OK` |
 | 实例 hook「仅安装不调用」 | ✅ 进程存活 |
-| **实例 hook「调用触发」** | ❌ SIGSEGV / SIGABRT，见下 |
+| **实例 hook 触发（app 驱动）** | ✅ 41 次命中无崩溃 |
+| **hook 后从 JS 侧调用该方法** | ✅ 修复后通过（见下） |
 
-### 实例 hook 崩溃（未解决）
+### 已修复：JS 侧调用被 hook 的方法导致崩溃
 
-崩溃发生在**调用被 hook 的实例方法**时，不是安装时。真机与模拟器、当前 HEAD 与
-8月8日的 legacy 归档版（md5 `9ed12abe`）**全部同样复现**，因此：
+**症状**：装好 `M.computeSum.implementation` 后，脚本里写 `M.computeSum(1,2)` 必崩；
+而 app 自己调用同一个被 hook 的方法完全正常（测过 41 次）。
 
-- 不是环境问题（自建 demo，无加固、非系统应用、非 intrinsic 方法）
-- 不是零 TLS 修复引入的
-- 不是 HEAD 相对 legacy 的回归
-
-崩溃栈的两类形态：
+**崩溃形态**（JS 线程 `wwb-javawoker`）：
 
 ```
-#01 libsigchain.so  AddSpecialSignalHandlerFn+32      ← 主动 abort
-#02 memfd:wwb_so (deleted) offset 0xd8000             ← agent 调用方
+#00 je_arena_ralloc_no_move+116   libc
+#01 je_arena_ralloc+160
+#02 je_realloc+240
+#03 realloc+88
+#04 memfd:wwb_so (deleted) offset 0x2c06f8   ← 对应 JS_GetPropertyStr+0x20
 ```
 
-`AddSpecialSignalHandlerFn` 在 AOSP 里对入参有严格校验，参数非法会直接 `abort()`。
-调用点集中在 `quickjs-hook/src/jsapi/java/art_controller.rs` 的 WalkStack SIGSEGV
-guard 安装逻辑（`module_dlsym("libsigchain.so", "AddSpecialSignalHandlerFn")`
-→ 构造 `SigchainAction` → `sc_sigaction`），以及 `agent/src/crash_handler.rs`。
+**根因**：普通 `.implementation` hook 走 ART router thunk。JS 线程自己调用被 hook
+的方法时，会在自己已有的 router 帧之上**再次进入 router**（重入），
+`FastHookInvokeBypass` 本应拦住它，但它只对 fastHook 家族生效
+（`fast_hook_invoke_meta` 要求 `HookType::Quick` + `is_fast_hook`），普通 hook 返回
+`None`，bypass 从未生效。
 
-下一步应核对该调用传入的 `SigchainAction` 各字段（尤其 handler 地址、`sa_flags`、
-`sa_mask`）与 AOSP `libsigchain` 的校验条件是否一致。
+**修复**（`quickjs-hook/src/jsapi/java/callback/{registry,invoke}.rs`，commit `ce40a7e`）：
+
+1. 新增 `any_hook_invoke_meta` —— 对所有已注册 hook 作答，不再限定 fastHook。
+2. router 类 hook 没有 `quick_trampoline`，无法用 C 侧 `orig_bypass` 槽位；改为设置
+   controller 侧标志（`set_call_original_bypass`），让 `art_router_stack_check`
+   跳过 replacement 直接调原方法。
+3. 三个调用入口（`_invokeMethod` / `_invokeStaticMethod` / `_newObject`）原本在
+   `raw_clone` 分支把 JNI method ID 直接当 ArtMethod 用、不解码，而注册表按 ArtMethod
+   索引、脚本恰好跑在 raw-clone 线程上，所以查表必然 miss。现在统一走 `for_method`
+   （先按原值查，失败再 `decode_method_id`）。
+
+**回归结果**（小米11 / Android 13 / SDK 33，7 项全过）：只装不调用、回调返回常量、
+静态 hook 不调用、静态 hook + JS 调用、丢弃 orig 返回值、调 orig 不返回、高频 tick。
