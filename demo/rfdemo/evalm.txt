@@ -1,0 +1,2 @@
+jsinit
+evalm (() => { console.log("[E] main thread eval works"); return "EVALM_OK"; })()
