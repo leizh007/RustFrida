@@ -24,18 +24,30 @@ NDK_BASE = os.path.expanduser("~/Android/Sdk/ndk")
 
 def find_ndk():
     """Find the latest Android NDK."""
-    if not os.path.isdir(NDK_BASE):
-        print(f"错误: NDK 目录不存在: {NDK_BASE}")
-        sys.exit(1)
-    versions = sorted(os.listdir(NDK_BASE), reverse=True)
-    if not versions:
-        print("错误: 未找到 NDK 版本")
-        sys.exit(1)
-    return os.path.join(NDK_BASE, versions[0])
+    candidates = [
+        os.path.expanduser("~/Android/Sdk/ndk"),
+        os.path.expanduser("~/Library/Android/sdk/ndk"),
+    ]
+    for base in candidates:
+        if os.path.isdir(base):
+            versions = sorted(os.listdir(base), reverse=True)
+            if versions:
+                return os.path.join(base, versions[0])
+    print(f"错误: NDK 目录不存在（试过: {', '.join(candidates)}）")
+    sys.exit(1)
+
+def toolchain_bin(ndk_path):
+    """Locate the prebuilt toolchain bin dir for this host."""
+    host_tags = ["darwin-x86_64", "linux-x86_64", "windows-x86_64"]
+    for tag in host_tags:
+        path = os.path.join(ndk_path, "toolchains", "llvm", "prebuilt", tag, "bin")
+        if os.path.isdir(path):
+            return path
+    return os.path.join(ndk_path, "toolchains", "llvm", "prebuilt", "linux-x86_64", "bin")
 
 def find_tool(ndk_path, tool):
     """Find an NDK tool in the toolchain."""
-    toolchain = os.path.join(ndk_path, "toolchains", "llvm", "prebuilt", "linux-x86_64", "bin")
+    toolchain = toolchain_bin(ndk_path)
     # Try llvm- prefixed first
     llvm_tool = os.path.join(toolchain, f"llvm-{tool}")
     if os.path.isfile(llvm_tool):
@@ -48,7 +60,7 @@ def find_tool(ndk_path, tool):
 
 def find_clang(ndk_path, api=33):
     """Find the NDK clang for aarch64."""
-    toolchain = os.path.join(ndk_path, "toolchains", "llvm", "prebuilt", "linux-x86_64", "bin")
+    toolchain = toolchain_bin(ndk_path)
     clang = os.path.join(toolchain, f"aarch64-linux-android{api}-clang")
     if os.path.isfile(clang):
         return clang

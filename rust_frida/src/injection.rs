@@ -328,66 +328,75 @@ pub(crate) fn watch_and_inject(
     timeout_secs: Option<u64>,
     string_overrides: &std::collections::HashMap<String, String>,
 ) -> Result<InjectionResult, String> {
-    use ldmonitor::DlopenMonitor;
-    use std::time::Duration;
+    #[cfg(not(feature = "ldmonitor"))]
+    {
+        let _ = (so_pattern, timeout_secs, string_overrides);
+        return Err("--watch-so 需要 ldmonitor eBPF 组件（构建时加 --features ldmonitor）".to_string());
+    }
 
-    log_info!("正在启动 eBPF 监听器，等待加载: {}", so_pattern);
+    #[cfg(feature = "ldmonitor")]
+    {
+        use ldmonitor::DlopenMonitor;
+        use std::time::Duration;
 
-    let monitor = DlopenMonitor::new(None).map_err(|e| format!("启动 eBPF 监听失败: {}", e))?;
+        log_info!("正在启动 eBPF 监听器，等待加载: {}", so_pattern);
 
-    let info = if let Some(secs) = timeout_secs {
-        log_info!("超时时间: {} 秒", secs);
-        monitor.wait_for_path_timeout(so_pattern, Duration::from_secs(secs))
-    } else {
-        log_info!("无超时限制，持续监听中...");
-        monitor.wait_for_path(so_pattern)
-    };
+        let monitor = DlopenMonitor::new(None).map_err(|e| format!("启动 eBPF 监听失败: {}", e))?;
 
-    monitor.stop();
+        let info = if let Some(secs) = timeout_secs {
+            log_info!("超时时间: {} 秒", secs);
+            monitor.wait_for_path_timeout(so_pattern, Duration::from_secs(secs))
+        } else {
+            log_info!("无超时限制，持续监听中...");
+            monitor.wait_for_path(so_pattern)
+        };
 
-    match info {
-        Some(dlopen_info) => {
-            let pid = dlopen_info.pid();
-            if let Some(ns_pid) = dlopen_info.ns_pid {
-                if ns_pid != dlopen_info.host_pid {
+        monitor.stop();
+
+        match info {
+            Some(dlopen_info) => {
+                let pid = dlopen_info.pid();
+                if let Some(ns_pid) = dlopen_info.ns_pid {
+                    if ns_pid != dlopen_info.host_pid {
+                        log_success!(
+                            "检测到 SO 加载: pid={} (host_pid={}), uid={}, path={}",
+                            ns_pid,
+                            dlopen_info.host_pid,
+                            dlopen_info.uid,
+                            dlopen_info.path
+                        );
+                    } else {
+                        log_success!(
+                            "检测到 SO 加载: pid={}, uid={}, path={}",
+                            pid,
+                            dlopen_info.uid,
+                            dlopen_info.path
+                        );
+                    }
+                } else {
                     log_success!(
-                        "检测到 SO 加载: pid={} (host_pid={}), uid={}, path={}",
-                        ns_pid,
+                        "检测到 SO 加载: host_pid={}, uid={}, path={}",
                         dlopen_info.host_pid,
                         dlopen_info.uid,
                         dlopen_info.path
                     );
-                } else {
-                    log_success!(
-                        "检测到 SO 加载: pid={}, uid={}, path={}",
-                        pid,
-                        dlopen_info.uid,
-                        dlopen_info.path
-                    );
                 }
-            } else {
-                log_success!(
-                    "检测到 SO 加载: host_pid={}, uid={}, path={}",
-                    dlopen_info.host_pid,
-                    dlopen_info.uid,
-                    dlopen_info.path
-                );
+
+                // 克隆 string_overrides 以便修改
+                let mut overrides = string_overrides.clone();
+
+                // 根据 uid 自动检测 /data/data/ 目录
+                if let Some(data_dir) = find_data_dir_by_uid(dlopen_info.uid) {
+                    log_info!("自动检测到应用数据目录: {}", data_dir);
+                    overrides.insert("output_path".to_string(), data_dir);
+                } else {
+                    log_warn!("未能找到 uid {} 对应的 /data/data/ 目录", dlopen_info.uid);
+                }
+
+                inject_via_bootstrapper(pid as i32, &overrides)
             }
-
-            // 克隆 string_overrides 以便修改
-            let mut overrides = string_overrides.clone();
-
-            // 根据 uid 自动检测 /data/data/ 目录
-            if let Some(data_dir) = find_data_dir_by_uid(dlopen_info.uid) {
-                log_info!("自动检测到应用数据目录: {}", data_dir);
-                overrides.insert("output_path".to_string(), data_dir);
-            } else {
-                log_warn!("未能找到 uid {} 对应的 /data/data/ 目录", dlopen_info.uid);
-            }
-
-            inject_via_bootstrapper(pid as i32, &overrides)
+            None => Err("监听超时，未检测到匹配的 SO 加载".to_string()),
         }
-        None => Err("监听超时，未检测到匹配的 SO 加载".to_string()),
     }
 }
 
